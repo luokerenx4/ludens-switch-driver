@@ -1,0 +1,252 @@
+diff --git a/src/Ryujinx.Input/HLE/NpadManager.cs b/src/Ryujinx.Input/HLE/NpadManager.cs
+index fcc527c..2492b0d 100644
+--- a/src/Ryujinx.Input/HLE/NpadManager.cs
++++ b/src/Ryujinx.Input/HLE/NpadManager.cs
+@@ -26,6 +26,8 @@ namespace Ryujinx.Input.HLE
+
+         private int _inputUpdateBlockCount;
+
++        public Func<GamepadInput?> InputOverride { get; set; }
++
+         private const int MaxControllers = 9;
+
+         private readonly NpadController[] _controllers;
+@@ -384,6 +386,7 @@ namespace Ryujinx.Input.HLE
+         {
+             lock (_lock)
+             {
++                GamepadInput? inputOverride = InputOverride?.Invoke();
+                 _hleInputStates.Clear();
+                 _hleMotionStates.Clear();
+
+@@ -424,6 +427,13 @@ namespace Ryujinx.Input.HLE
+                         motionState.Item1.Orientation = new float[9];
+                     }
+
++                    if (inputOverride.HasValue && playerIndex == PlayerIndex.Player1)
++                    {
++                        inputState = inputOverride.Value;
++                        inputState.Buttons |= _device.Hid.UpdateStickButtons(inputState.LStick, inputState.RStick);
++                        motionState = (new SixAxisInput { Orientation = new float[9] }, default);
++                    }
++
+                     inputState.PlayerId = playerIndex;
+                     motionState.Item1.PlayerId = playerIndex;
+
+diff --git a/src/Ryujinx.Input/HLE/TouchScreenManager.cs b/src/Ryujinx.Input/HLE/TouchScreenManager.cs
+index 28d800d..0eb7532 100644
+--- a/src/Ryujinx.Input/HLE/TouchScreenManager.cs
++++ b/src/Ryujinx.Input/HLE/TouchScreenManager.cs
+@@ -11,6 +11,7 @@ namespace Ryujinx.Input.HLE
+         private readonly IMouse _mouse;
+         private Switch _device;
+         private bool _wasClicking;
++        public Func<(bool Down, uint X, uint Y)?> InputOverride { get; set; }
+
+         public TouchScreenManager(IMouse mouse)
+         {
+@@ -24,6 +25,21 @@ namespace Ryujinx.Input.HLE
+
+         public bool Update(bool isFocused, bool isClicking = false, float aspectRatio = 0)
+         {
++            if (InputOverride?.Invoke() is { } input)
++            {
++                if (!input.Down && !_wasClicking) return false;
++                _device.Hid.Touchscreen.Update(new TouchPoint
++                {
++                    Attribute = !_wasClicking ? TouchAttribute.Start : !input.Down ? TouchAttribute.End : TouchAttribute.None,
++                    X = input.X,
++                    Y = input.Y,
++                    DiameterX = 10,
++                    DiameterY = 10,
++                    Angle = 90,
++                });
++                _wasClicking = input.Down;
++                return true;
++            }
+             if (!isFocused || (!_wasClicking && !isClicking))
+             {
+                 // In case we lost focus, send the end touch.
+diff --git a/src/Ryujinx/Systems/AppHost.cs b/src/Ryujinx/Systems/AppHost.cs
+index 650ea5a..ed16dd9 100644
+--- a/src/Ryujinx/Systems/AppHost.cs
++++ b/src/Ryujinx/Systems/AppHost.cs
+@@ -131,6 +131,8 @@ namespace Ryujinx.Ava.Systems
+
+         public VirtualFileSystem VirtualFileSystem { get; }
+         public ContentManager ContentManager { get; }
++        private RsaBridge _rsaBridge;
++
+         public NpadManager NpadManager { get; }
+         public TouchScreenManager TouchScreenManager { get; }
+         public HLE.Switch Device { get; set; }
+@@ -392,6 +394,7 @@ namespace Ryujinx.Ava.Systems
+
+         private void Renderer_ScreenCaptured(object sender, ScreenCaptureImageInfo e)
+         {
++            if (_rsaBridge?.ScreenCaptured(e) == true) return;
+             if (e.Data.Length > 0 && e.Height > 0 && e.Width > 0)
+             {
+                 Task.Run(() =>
+@@ -647,6 +650,9 @@ namespace Ryujinx.Ava.Systems
+         // MUST be public to inherit from IDisposable
+         public void Dispose()
+         {
++            _rsaBridge?.Dispose();
++            NpadManager.InputOverride = null;
++            TouchScreenManager.InputOverride = null;
+             if (Device.Processes != null)
+             {
+                 MainWindowViewModel.UpdateGameMetadata(Device.Processes.ActiveApplication?.ProgramIdText, 
+@@ -1107,6 +1113,12 @@ namespace Ryujinx.Ava.Systems
+             _renderer = Device.Gpu.Renderer is ThreadedRenderer tr ? tr.BaseRenderer : Device.Gpu.Renderer;
+
+             _renderer.ScreenCaptured += Renderer_ScreenCaptured;
++            if (Environment.GetEnvironmentVariable("RSA_BRIDGE_PORT") is string rsaPort)
++            {
++                _rsaBridge = new RsaBridge(int.Parse(rsaPort));
++                NpadManager.InputOverride = _rsaBridge.Poll;
++                TouchScreenManager.InputOverride = _rsaBridge.PollTouch;
++            }
+
+             (RendererHost.EmbeddedWindow as EmbeddedWindowOpenGL)?.InitializeBackgroundContext(_renderer);
+
+@@ -1155,6 +1167,7 @@ namespace Ryujinx.Ava.Systems
+                                 InitStatus();
+                             }
+
++                            _rsaBridge?.BeforePresent(Device.Gpu.Renderer);
+                             Device.PresentFrame(() =>
+                                 (RendererHost.EmbeddedWindow as EmbeddedWindowOpenGL)?.SwapBuffers());
+                         }
+@@ -1440,12 +1453,10 @@ namespace Ryujinx.Ava.Systems
+             }
+
+             // Touchscreen.
+-            bool hasTouch = false;
+-
+-            if (_viewModel.IsActive && !ConfigurationState.Instance.Hid.EnableMouse.Value)
+-            {
+-                hasTouch = TouchScreenManager.Update(true, (_inputManager.MouseDriver as AvaloniaMouseDriver).IsButtonPressed(MouseButton.Button1), ConfigurationState.Instance.Graphics.AspectRatio.Value.ToFloat());
+-            }
++            bool nativeTouch = _viewModel.IsActive && !ConfigurationState.Instance.Hid.EnableMouse.Value;
++            bool hasTouch = TouchScreenManager.Update(nativeTouch,
++                nativeTouch && (_inputManager.MouseDriver as AvaloniaMouseDriver).IsButtonPressed(MouseButton.Button1),
++                ConfigurationState.Instance.Graphics.AspectRatio.Value.ToFloat());
+
+             if (!hasTouch)
+             {
+diff --git a/src/Ryujinx/UI/Applet/SwkbdAppletDialog.axaml.cs b/src/Ryujinx/UI/Applet/SwkbdAppletDialog.axaml.cs
+index e851425..f4816d6 100644
+--- a/src/Ryujinx/UI/Applet/SwkbdAppletDialog.axaml.cs
++++ b/src/Ryujinx/UI/Applet/SwkbdAppletDialog.axaml.cs
+@@ -1,9 +1,12 @@
++using Avalonia;
+ using Avalonia.Controls;
++using Avalonia.Media.Imaging;
+ using Avalonia.Input;
+ using Avalonia.Interactivity;
+ using Avalonia.Media;
+ using FluentAvalonia.UI.Controls;
+ using Ryujinx.Ava.Common.Locale;
++using Ryujinx.Ava.Systems;
+ using Ryujinx.Ava.UI.Helpers;
+ using Ryujinx.HLE.HOS.Applets;
+ using Ryujinx.HLE.HOS.Applets.SoftwareKeyboard;
+@@ -22,6 +25,52 @@ namespace Ryujinx.Ava.UI.Controls
+         private readonly string _placeholder;
+
+         private FAContentDialog _host;
++        internal static SwkbdAppletDialog RsaActive { get; private set; }
++
++        internal void RsaCapture(string path)
++        {
++            var size = _host.Bounds.Size;
++            using RenderTargetBitmap bitmap = new(new PixelSize((int)Math.Ceiling(size.Width * 2), (int)Math.Ceiling(size.Height * 2)), new Vector(192, 192));
++            bitmap.Render(_host);
++            bitmap.Save(path);
++        }
++
++        internal void RsaInput(string operation, string value)
++        {
++            string text = Input.Text ?? string.Empty;
++            int start = Math.Min(Input.SelectionStart, Input.SelectionEnd);
++            int end = Math.Max(Input.SelectionStart, Input.SelectionEnd);
++            if (operation == "type")
++            {
++                Input.Text = text[..start] + value + text[end..];
++                Input.SelectionStart = Input.SelectionEnd = start + value.Length;
++            }
++            else if (operation == "press")
++            {
++                switch (value)
++                {
++                    case "CTRL+A": Input.SelectAll(); break;
++                    case "BACKSPACE":
++                        if (start == end && start > 0)
++                        {
++                            start--;
++                            if (start > 0 && char.IsLowSurrogate(text[start]) && char.IsHighSurrogate(text[start - 1])) start--;
++                        }
++                        Input.Text = text[..start] + text[end..];
++                        Input.SelectionStart = Input.SelectionEnd = start;
++                        break;
++                    case "ENTER":
++                        if (!_checkLength(text.Length) || !_checkInput(text)) throw new InvalidOperationException("TEXT_INVALID");
++                        _host.Hide(FAContentDialogResult.Primary);
++                        return;
++                    case "ESCAPE": _host.Hide(FAContentDialogResult.None); return;
++                    default: throw new ArgumentException("Unknown keyboard key");
++                }
++            }
++            else throw new ArgumentException("Unknown keyboard operation");
++            Message = Input.Text ?? string.Empty;
++            _host.IsPrimaryButtonEnabled = _checkLength(Message.Length) && _checkInput(Message);
++        }
+
+         public SwkbdAppletDialog(string mainText, string secondaryText, string placeholder, string message)
+         {
+@@ -95,7 +144,24 @@ namespace Ryujinx.Ava.UI.Controls
+
+             contentDialog.Closed += Handler;
+
+-            await ContentDialogHelper.ShowAsync(contentDialog);
++            contentDialog.Opened += (_, _) =>
++            {
++                RsaActive = content;
++                RsaBridge.Current?.CaptureDialog();
++            };
++            // AI owns this text surface too. Bridge input updates the control directly;
++            // native keyboard/pointer events resume immediately after ownership ends.
++            void BlockHuman(object sender, RoutedEventArgs e)
++            {
++                if (RsaBridge.Current?.Owned == true) e.Handled = true;
++            }
++            contentDialog.AddHandler(KeyDownEvent, BlockHuman, RoutingStrategies.Tunnel);
++            contentDialog.AddHandler(KeyUpEvent, BlockHuman, RoutingStrategies.Tunnel);
++            contentDialog.AddHandler(TextInputEvent, BlockHuman, RoutingStrategies.Tunnel);
++            contentDialog.AddHandler(PointerPressedEvent, BlockHuman, RoutingStrategies.Tunnel);
++            contentDialog.AddHandler(PointerReleasedEvent, BlockHuman, RoutingStrategies.Tunnel);
++            try { await ContentDialogHelper.ShowAsync(contentDialog); }
++            finally { if (RsaActive == content) RsaActive = null; }
+
+             return (result, input);
+         }
+diff --git a/nuget.config b/nuget.config
+index 6ed8f8d..c377d6c 100644
+--- a/nuget.config
++++ b/nuget.config
+@@ -1,11 +1,11 @@
+-﻿<?xml version="1.0" encoding="utf-8"?>
++<?xml version="1.0" encoding="utf-8"?>
+
+ <configuration>
+     <packageSources>
+         <clear />
+         <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+         <!-- Only needed when using pre-release versions of Ryujinx.LibHac. -->
+-        <add key="LibHacAlpha" value="https://git.ryujinx.app/api/packages/projects/nuget/index.json" />
++        <add key="LibHacAlpha" value="https://nuget.ryulynx.org/v3/index.json" />
+     </packageSources>
+     <packageSourceMapping>
+         <!-- key value for <packageSource> should match key values from <packageSources> element -->
