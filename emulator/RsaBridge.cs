@@ -4,11 +4,12 @@ using Ryujinx.Common.Logging;
 using Ryujinx.Ava.UI.Controls;
 using Avalonia.Threading;
 using Ryujinx.HLE.HOS.Services.Hid;
-using SkiaSharp;
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -39,8 +40,28 @@ internal sealed class RsaBridge : IDisposable
     private TaskCompletionSource<string[]> _touchRequest;
     private string _touchCommandId;
     private long _frame;
+    private long _lastCaptureRequestAt;
+    private long _lastDeliveredFrame;
+    private int _inFlightCaptures;
+    private readonly Queue<(long Frame, long QueuedAt)> _pendingScreenshots = new();
+    private EncodedFrame _latestEncoded;
+    private static readonly uint[] Crc32Table = CreateCrc32Table();
+
+    private sealed record EncodedFrame(long Frame, byte[] Bytes, long QueuedAt, long CallbackAt, long WorkerAt, long EncodedAt);
+    private sealed record PngStrip(byte[] Compressed, int FilteredLength, uint S1, uint S2);
 
     private sealed record Span(GamepadInput State, long EndMs);
+
+    [System.Runtime.CompilerServices.ModuleInitializer]
+    internal static void InitializeBridgeEnvironment()
+    {
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("RSA_BRIDGE_PORT")) &&
+            Environment.GetEnvironmentVariable("LUDENS_BRIDGE_PORT") is { Length: > 0 } port)
+        {
+            Environment.SetEnvironmentVariable("RSA_BRIDGE_PORT", port);
+        }
+    }
+
     private sealed class ActionRun(string id, Span[] spans)
     {
         public readonly string Id = id;
@@ -54,9 +75,6 @@ internal sealed class RsaBridge : IDisposable
         public readonly string Path = path;
         public readonly TaskCompletionSource<string[]> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public readonly long ReceivedAt = Stopwatch.GetTimestamp();
-        public bool Requested;
-        public long Frame;
-        public long QueuedAt;
     }
 
     public RsaBridge(int port)
@@ -145,14 +163,15 @@ internal sealed class RsaBridge : IDisposable
     // Invoked on the GPU thread immediately before presentation.
     public void BeforePresent(IRenderer renderer)
     {
-        Capture capture;
         long frame;
         lock (_gate)
         {
             frame = ++_frame;
-            capture = _capture is { Requested: false } ? _capture : null;
+            bool shouldCapture = SwkbdAppletDialog.RsaActive == null && _inFlightCaptures < 4 &&
+                (_capture != null || (_lastCaptureRequestAt != 0 && Stopwatch.GetElapsedTime(_lastCaptureRequestAt).TotalMilliseconds < 500));
+            if (!shouldCapture) return;
+            _inFlightCaptures++;
         }
-        if (capture == null) return;
 
         // The full renderer queues this action behind older presentations and
         // waits for it before the GPU thread submits the next Present. Never
@@ -161,10 +180,12 @@ internal sealed class RsaBridge : IDisposable
         {
             lock (_gate)
             {
-                if (_capture != capture) return;
-                capture.Requested = true;
-                capture.Frame = frame;
-                capture.QueuedAt = Stopwatch.GetTimestamp();
+                if (SwkbdAppletDialog.RsaActive != null)
+                {
+                    _inFlightCaptures--;
+                    return;
+                }
+                _pendingScreenshots.Enqueue((frame, Stopwatch.GetTimestamp()));
                 renderer.Screenshot();
             }
         });
@@ -173,46 +194,204 @@ internal sealed class RsaBridge : IDisposable
     public bool ScreenCaptured(ScreenCaptureImageInfo image)
     {
         long callbackAt = Stopwatch.GetTimestamp();
-        Capture capture;
+        (long Frame, long QueuedAt) pending;
         lock (_gate)
         {
-            capture = _capture;
-            if (capture == null || !capture.Requested) return false;
-            _capture = null;
+            if (!_pendingScreenshots.TryDequeue(out pending)) return false;
         }
-        // Encoding off the renderer thread keeps capture from stalling the game.
+
+        // Encode in parallel with subsequent GPU presents and screenshot callbacks.
         _ = Task.Run(() =>
         {
             long workerAt = Stopwatch.GetTimestamp();
+            Capture waiting = null;
             try
             {
-                SKColorType format = image.IsBgra ? SKColorType.Bgra8888 : SKColorType.Rgba8888;
-                using SKBitmap source = new(new SKImageInfo(image.Width, image.Height, format, SKAlphaType.Premul));
-                Marshal.Copy(image.Data, 0, source.GetPixels(), image.Data.Length);
-                using SKBitmap target = new(image.Width, image.Height);
-                using SKCanvas canvas = new(target);
-                canvas.Clear(SKColors.Black);
-                canvas.SetMatrix(SKMatrix.CreateScale(image.FlipX ? -1 : 1, image.FlipY ? -1 : 1, image.Width / 2f, image.Height / 2f));
-                canvas.DrawBitmap(source, SKPoint.Empty);
-                // Capture favors latency: lossless level 1 avoids ~0.5s of PNG compression per 1080p frame.
-                using SKPixmap pixels = target.PeekPixels();
-                using SKData png = pixels.Encode(new SKPngEncoderOptions(SKPngEncoderFilterFlags.AllFilters, 1));
-                using FileStream file = File.Create(capture.Path);
-                png.SaveTo(file);
-                file.Flush();
-                long completedAt = Stopwatch.GetTimestamp();
-                capture.Done.TrySetResult([capture.Frame.ToString(CultureInfo.InvariantCulture)]);
-                LogCapture(capture, "game", capture.Frame, completedAt, writer =>
+                byte[] pngBytes = EncodePng(image);
+                long encodedAt = Stopwatch.GetTimestamp();
+                lock (_gate)
                 {
-                    writer.WriteNumber("receivedToQueuedMs", Stopwatch.GetElapsedTime(capture.ReceivedAt, capture.QueuedAt).TotalMilliseconds);
-                    writer.WriteNumber("queuedToCallbackMs", Stopwatch.GetElapsedTime(capture.QueuedAt, callbackAt).TotalMilliseconds);
-                    writer.WriteNumber("callbackToWorkerMs", Stopwatch.GetElapsedTime(callbackAt, workerAt).TotalMilliseconds);
-                    writer.WriteNumber("encodeSaveMs", Stopwatch.GetElapsedTime(workerAt, completedAt).TotalMilliseconds);
-                });
+                    if (_capture != null && SwkbdAppletDialog.RsaActive == null && pending.Frame > _lastDeliveredFrame)
+                    {
+                        waiting = _capture;
+                        _capture = null;
+                        _lastDeliveredFrame = pending.Frame;
+                    }
+                    else if (pending.Frame > _lastDeliveredFrame && (_latestEncoded == null || pending.Frame > _latestEncoded.Frame))
+                    {
+                        _latestEncoded = new EncodedFrame(pending.Frame, pngBytes, pending.QueuedAt, callbackAt, workerAt, encodedAt);
+                    }
+                }
+                if (waiting != null)
+                {
+                    File.WriteAllBytes(waiting.Path, pngBytes);
+                    long completedAt = Stopwatch.GetTimestamp();
+                    waiting.Done.TrySetResult([pending.Frame.ToString(CultureInfo.InvariantCulture)]);
+                    LogCapture(waiting, "game", pending.Frame, completedAt, writer =>
+                    {
+                        writer.WriteNumber("receivedToQueuedMs", Stopwatch.GetElapsedTime(waiting.ReceivedAt, pending.QueuedAt).TotalMilliseconds);
+                        writer.WriteNumber("queuedToCallbackMs", Stopwatch.GetElapsedTime(pending.QueuedAt, callbackAt).TotalMilliseconds);
+                        writer.WriteNumber("callbackToWorkerMs", Stopwatch.GetElapsedTime(callbackAt, workerAt).TotalMilliseconds);
+                        writer.WriteNumber("encodeSaveMs", Stopwatch.GetElapsedTime(workerAt, completedAt).TotalMilliseconds);
+                    });
+                }
             }
-            catch (Exception error) { capture.Done.TrySetException(error); }
+            catch (Exception error) { waiting?.Done.TrySetException(error); }
+            finally { lock (_gate) _inFlightCaptures--; }
         });
         return true;
+    }
+
+    private static byte[] EncodePng(ScreenCaptureImageInfo image)
+    {
+        const int chunks = 6;
+        int width = image.Width;
+        int height = image.Height;
+        int rowsPerChunk = (height + chunks - 1) / chunks;
+        int bytesPerRow = width * 4;
+        byte[] source = image.Data;
+        PngStrip[] strips = new PngStrip[chunks];
+
+        Parallel.For(0, chunks, chunk =>
+        {
+            int startY = chunk * rowsPerChunk;
+            int endY = Math.Min(height, startY + rowsPerChunk);
+            if (startY >= endY) return;
+            int filteredLength = (endY - startY) * (bytesPerRow + 1);
+            byte[] filtered = new byte[filteredLength];
+            uint s1 = 0;
+            uint s2 = 0;
+            int adlerBlock = 0;
+            int outputOffset = 0;
+
+            for (int y = startY; y < endY; y++)
+            {
+                int srcY = image.FlipY ? height - 1 - y : y;
+                int sourceRow = srcY * bytesPerRow;
+                filtered[outputOffset++] = 1;
+                byte prevR = 0, prevG = 0, prevB = 0, prevA = 0;
+                for (int x = 0; x < width; x++)
+                {
+                    int srcX = image.FlipX ? width - 1 - x : x;
+                    int sourceOffset = sourceRow + srcX * 4;
+                    byte r, g, b;
+                    if (image.IsBgra)
+                    {
+                        b = source[sourceOffset];
+                        g = source[sourceOffset + 1];
+                        r = source[sourceOffset + 2];
+                    }
+                    else
+                    {
+                        r = source[sourceOffset];
+                        g = source[sourceOffset + 1];
+                        b = source[sourceOffset + 2];
+                    }
+                    const byte a = 255;
+                    filtered[outputOffset++] = (byte)(r - prevR);
+                    filtered[outputOffset++] = (byte)(g - prevG);
+                    filtered[outputOffset++] = (byte)(b - prevB);
+                    filtered[outputOffset++] = (byte)(a - prevA);
+                    prevR = r;
+                    prevG = g;
+                    prevB = b;
+                    prevA = a;
+                }
+
+                int rowEnd = outputOffset;
+                for (int i = rowEnd - bytesPerRow - 1; i < rowEnd; i++)
+                {
+                    s1 += filtered[i];
+                    s2 += s1;
+                    if (++adlerBlock == 5552)
+                    {
+                        s1 %= 65521;
+                        s2 %= 65521;
+                        adlerBlock = 0;
+                    }
+                }
+            }
+            s1 %= 65521;
+            s2 %= 65521;
+
+            using MemoryStream compressed = new();
+            DeflateStream deflate = new(compressed, CompressionLevel.Fastest, leaveOpen: true);
+            deflate.Write(filtered, 0, filtered.Length);
+            if (endY < height)
+            {
+                // Z_SYNC_FLUSH: byte-align a non-final block so the next strip
+                // can continue the same zlib stream without a BFINAL marker.
+                deflate.Flush();
+            }
+            else
+            {
+                deflate.Dispose();
+            }
+            strips[chunk] = new PngStrip(compressed.ToArray(), filteredLength, s1, s2);
+        });
+
+        uint adler1 = 1;
+        uint adler2 = 0;
+        using MemoryStream idat = new();
+        idat.WriteByte(0x78);
+        idat.WriteByte(0x01);
+        foreach (PngStrip strip in strips)
+        {
+            if (strip == null) continue;
+            idat.Write(strip.Compressed, 0, strip.Compressed.Length);
+            adler2 = (uint)((adler2 + (ulong)(strip.FilteredLength % 65521) * adler1 + strip.S2) % 65521);
+            adler1 = (adler1 + strip.S1) % 65521;
+        }
+        WriteUInt32(idat, (adler2 << 16) | adler1);
+
+        using MemoryStream ihdr = new();
+        WriteUInt32(ihdr, (uint)width);
+        WriteUInt32(ihdr, (uint)height);
+        ihdr.Write([8, 6, 0, 0, 0]);
+
+        using MemoryStream png = new();
+        png.Write([137, 80, 78, 71, 13, 10, 26, 10]);
+        WriteChunk(png, "IHDR", ihdr.GetBuffer().AsSpan(0, (int)ihdr.Length));
+        WriteChunk(png, "IDAT", idat.GetBuffer().AsSpan(0, (int)idat.Length));
+        WriteChunk(png, "IEND", ReadOnlySpan<byte>.Empty);
+        return png.ToArray();
+    }
+
+    private static void WriteChunk(Stream output, string type, ReadOnlySpan<byte> data)
+    {
+        WriteUInt32(output, (uint)data.Length);
+        uint crc = 0xFFFFFFFFu;
+        foreach (byte value in Encoding.ASCII.GetBytes(type))
+        {
+            output.WriteByte(value);
+            crc = Crc32Table[(crc ^ value) & 0xFF] ^ (crc >> 8);
+        }
+        foreach (byte value in data)
+        {
+            crc = Crc32Table[(crc ^ value) & 0xFF] ^ (crc >> 8);
+        }
+        output.Write(data);
+        WriteUInt32(output, crc ^ 0xFFFFFFFFu);
+    }
+
+    private static void WriteUInt32(Stream output, uint value)
+    {
+        output.WriteByte((byte)(value >> 24));
+        output.WriteByte((byte)(value >> 16));
+        output.WriteByte((byte)(value >> 8));
+        output.WriteByte((byte)value);
+    }
+
+    private static uint[] CreateCrc32Table()
+    {
+        uint[] table = new uint[256];
+        for (uint i = 0; i < table.Length; i++)
+        {
+            uint crc = i;
+            for (int bit = 0; bit < 8; bit++) crc = (crc & 1) != 0 ? 0xEDB88320u ^ (crc >> 1) : crc >> 1;
+            table[i] = crc;
+        }
+        return table;
     }
 
     // Foreground Switch software keyboards pause game presentation. Capture the
@@ -295,6 +474,7 @@ internal sealed class RsaBridge : IDisposable
             _epoch = null;
             _capture?.Done.TrySetException(new IOException("Device bridge disconnected"));
             _capture = null;
+            _latestEncoded = null;
         }
     }
 
@@ -351,8 +531,37 @@ internal sealed class RsaBridge : IDisposable
                 if (_capture != null) throw new InvalidOperationException("CAPTURE_BUSY");
                 if (!Path.IsPathFullyQualified(fields[2])) throw new ArgumentException("Absolute capture path required");
                 Capture capture = new(fields[2]);
-                _capture = capture;
-                CaptureDialog();
+                _lastCaptureRequestAt = capture.ReceivedAt;
+                if (SwkbdAppletDialog.RsaActive == null && _latestEncoded != null && _latestEncoded.Frame > _lastDeliveredFrame &&
+                    Stopwatch.GetElapsedTime(_latestEncoded.EncodedAt, capture.ReceivedAt).TotalMilliseconds < 100)
+                {
+                    EncodedFrame cached = _latestEncoded;
+                    _latestEncoded = null;
+                    _lastDeliveredFrame = cached.Frame;
+                    _capture = capture;
+                    _ = Task.Run(() =>
+                    {
+                        try
+                        {
+                            File.WriteAllBytes(capture.Path, cached.Bytes);
+                            long completedAt = Stopwatch.GetTimestamp();
+                            capture.Done.TrySetResult([cached.Frame.ToString(CultureInfo.InvariantCulture)]);
+                            LogCapture(capture, "game", cached.Frame, completedAt, writer =>
+                            {
+                                writer.WriteNumber("receivedToQueuedMs", Stopwatch.GetElapsedTime(capture.ReceivedAt, cached.QueuedAt).TotalMilliseconds);
+                                writer.WriteNumber("queuedToCallbackMs", Stopwatch.GetElapsedTime(cached.QueuedAt, cached.CallbackAt).TotalMilliseconds);
+                                writer.WriteNumber("callbackToWorkerMs", Stopwatch.GetElapsedTime(cached.CallbackAt, cached.WorkerAt).TotalMilliseconds);
+                                writer.WriteNumber("encodeSaveMs", Stopwatch.GetElapsedTime(cached.WorkerAt, completedAt).TotalMilliseconds);
+                            });
+                        }
+                        catch (Exception error) { capture.Done.TrySetException(error); }
+                    });
+                }
+                else
+                {
+                    _capture = capture;
+                    CaptureDialog();
+                }
                 return AwaitCapture(capture);
             }
             string epoch = fields[2];

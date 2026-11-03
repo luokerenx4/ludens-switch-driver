@@ -61,3 +61,66 @@ for (const driver of ["ryubing"] as const) {
     }
   });
 }
+
+for (const driver of ["ryubing"] as const) {
+  test(`${driver} zero-delay burst captures keep sequence monotonic and clean temporary files`, async () => {
+    let frame = 0;
+    let surface = "screen";
+    const paths: string[] = [];
+    const server = createServer(socket => {
+      let buffer = "";
+      socket.setEncoding("utf8");
+      socket.on("data", chunk => {
+        buffer += chunk;
+        let end: number;
+        while ((end = buffer.indexOf("\n")) >= 0) {
+          const [id, op, ...args] = buffer.slice(0, end).split("\t");
+          buffer = buffer.slice(end + 1);
+          const reply = (status: string, ...fields: string[]) => socket.write([id, status, ...fields].join("\t") + "\n");
+          if (op === "HELLO") reply("OK", "ryubing-rsa-3");
+          else if (op === "TOUCH_INFO") reply("OK", "0", "0", "319", "239");
+          else if (op === "CAPTURE") {
+            paths.push(args[0]);
+            void (async () => {
+              await writeFile(args[0], png);
+              reply("OK", surface === "keyboard" ? "0" : String(++frame), surface);
+            })();
+          } else reply("ERROR", `Unexpected ${op}`);
+        }
+      });
+    });
+    const listening = Promise.withResolvers<void>();
+    server.listen(0, "127.0.0.1", () => listening.resolve());
+    await listening.promise;
+    const provider = await createSwitchProvider({ port: (server.address() as AddressInfo).port,
+      clock: { id: "fixture", now: () => performance.now() } });
+    try {
+      const capture = provider.capabilities.controllers.find(controller => controller.tool.name ===
+        "screen.capture")!;
+      let gameFrames = 0;
+      for (let index = 0; index < 20; index++) {
+        surface = index === 10 ? "keyboard" : "screen";
+        const result = await capture.execute({}, { signal: new AbortController().signal });
+        const output = result.result.structuredContent as Record<string, unknown>;
+        if (surface === "keyboard") {
+          expect(output.source).toBe("keyboard");
+          expect(output).not.toHaveProperty("sourceSequence");
+        } else {
+          gameFrames++;
+          expect(output.source).toBe("screen");
+          expect(output.sourceSequence).toBe(gameFrames);
+        }
+        expect(result.result.content[0]).toEqual({ type: "image", mimeType: "image/png", data: png.toString("base64") });
+        await expect(access(dirname(paths.at(-1)!))).rejects.toThrow();
+      }
+      expect(gameFrames).toBe(19);
+      expect(frame).toBe(19);
+      expect(paths).toHaveLength(20);
+    } finally {
+      provider.close();
+      const closed = Promise.withResolvers<void>();
+      server.close(error => error ? closed.reject(error) : closed.resolve());
+      await closed.promise;
+    }
+  });
+}
