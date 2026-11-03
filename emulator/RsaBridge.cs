@@ -5,6 +5,7 @@ using Ryujinx.Ava.UI.Controls;
 using Avalonia.Threading;
 using Ryujinx.HLE.HOS.Services.Hid;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -47,8 +48,7 @@ internal sealed class RsaBridge : IDisposable
     private EncodedFrame _latestEncoded;
     private static readonly uint[] Crc32Table = CreateCrc32Table();
 
-    private sealed record EncodedFrame(long Frame, byte[] Bytes, long QueuedAt, long CallbackAt, long WorkerAt, long EncodedAt);
-    private sealed record PngStrip(byte[] Compressed, int FilteredLength, uint S1, uint S2);
+    private sealed record EncodedFrame(long Frame, byte[] Bytes, int Length, long QueuedAt, long CallbackAt, long WorkerAt, long EncodedAt);
 
     private sealed record Span(GamepadInput State, long EndMs);
 
@@ -75,6 +75,7 @@ internal sealed class RsaBridge : IDisposable
         public readonly string Path = path;
         public readonly TaskCompletionSource<string[]> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public readonly long ReceivedAt = Stopwatch.GetTimestamp();
+        public bool Claimed;
     }
 
     public RsaBridge(int port)
@@ -167,8 +168,12 @@ internal sealed class RsaBridge : IDisposable
         lock (_gate)
         {
             frame = ++_frame;
-            bool shouldCapture = SwkbdAppletDialog.RsaActive == null && _inFlightCaptures < 4 &&
-                (_capture != null || (_lastCaptureRequestAt != 0 && Stopwatch.GetElapsedTime(_lastCaptureRequestAt).TotalMilliseconds < 500));
+            // Never spin screenshotting while a fresh unconsumed frame is already
+            // encoded and waiting; only shoot when a CAPTURE needs newer pixels.
+            bool wantsFrame = _capture is { Claimed: false } ||
+                ((_latestEncoded == null || _latestEncoded.Frame <= _lastDeliveredFrame) &&
+                    (_lastCaptureRequestAt != 0 && Stopwatch.GetElapsedTime(_lastCaptureRequestAt).TotalMilliseconds < 500));
+            bool shouldCapture = SwkbdAppletDialog.RsaActive == null && _inFlightCaptures < 2 && wantsFrame;
             if (!shouldCapture) return;
             _inFlightCaptures++;
         }
@@ -205,26 +210,32 @@ internal sealed class RsaBridge : IDisposable
         {
             long workerAt = Stopwatch.GetTimestamp();
             Capture waiting = null;
+            byte[] pngBuffer = null;
             try
             {
-                byte[] pngBytes = EncodePng(image);
+                pngBuffer = EncodePng(image, out int pngLength);
                 long encodedAt = Stopwatch.GetTimestamp();
+                bool cached = false;
                 lock (_gate)
                 {
-                    if (_capture != null && SwkbdAppletDialog.RsaActive == null && pending.Frame > _lastDeliveredFrame)
+                    if (_capture is { Claimed: false } && SwkbdAppletDialog.RsaActive == null && pending.Frame > _lastDeliveredFrame)
                     {
                         waiting = _capture;
+                        waiting.Claimed = true;
                         _capture = null;
                         _lastDeliveredFrame = pending.Frame;
                     }
                     else if (pending.Frame > _lastDeliveredFrame && (_latestEncoded == null || pending.Frame > _latestEncoded.Frame))
                     {
-                        _latestEncoded = new EncodedFrame(pending.Frame, pngBytes, pending.QueuedAt, callbackAt, workerAt, encodedAt);
+                        if (_latestEncoded != null) ArrayPool<byte>.Shared.Return(_latestEncoded.Bytes);
+                        _latestEncoded = new EncodedFrame(pending.Frame, pngBuffer, pngLength, pending.QueuedAt, callbackAt, workerAt, encodedAt);
+                        cached = true;
                     }
                 }
+                if (cached) pngBuffer = null;
                 if (waiting != null)
                 {
-                    File.WriteAllBytes(waiting.Path, pngBytes);
+                    WritePngFile(waiting.Path, pngBuffer, pngLength);
                     long completedAt = Stopwatch.GetTimestamp();
                     waiting.Done.TrySetResult([pending.Frame.ToString(CultureInfo.InvariantCulture)]);
                     LogCapture(waiting, "game", pending.Frame, completedAt, writer =>
@@ -235,151 +246,189 @@ internal sealed class RsaBridge : IDisposable
                         writer.WriteNumber("encodeSaveMs", Stopwatch.GetElapsedTime(workerAt, completedAt).TotalMilliseconds);
                     });
                 }
+                if (pngBuffer != null)
+                {
+                    ArrayPool<byte>.Shared.Return(pngBuffer);
+                    pngBuffer = null;
+                }
             }
             catch (Exception error) { waiting?.Done.TrySetException(error); }
-            finally { lock (_gate) _inFlightCaptures--; }
+            finally
+            {
+                if (pngBuffer != null) ArrayPool<byte>.Shared.Return(pngBuffer);
+                lock (_gate) _inFlightCaptures--;
+            }
         });
         return true;
     }
 
-    private static byte[] EncodePng(ScreenCaptureImageInfo image)
+    // Encodes into ArrayPool-backed buffers only: one rented filter buffer and
+    // one rented PNG buffer per frame, so a 1080p frame costs no fresh LOH
+    // allocations. Filtering runs in parallel over disjoint row blocks; deflate
+    // writes once, straight into the IDAT region of the final PNG buffer, so its
+    // native zlib state is released on Dispose instead of piling up until
+    // finalizers run. The returned buffer is pool-owned; callers must return it
+    // to ArrayPool<byte>.Shared once the PNG bytes are consumed.
+    private static byte[] EncodePng(ScreenCaptureImageInfo image, out int pngLength)
     {
         const int chunks = 6;
         int width = image.Width;
         int height = image.Height;
         int rowsPerChunk = (height + chunks - 1) / chunks;
         int bytesPerRow = width * 4;
+        int filteredLength = height * (bytesPerRow + 1);
         byte[] source = image.Data;
-        PngStrip[] strips = new PngStrip[chunks];
-
-        Parallel.For(0, chunks, chunk =>
+        byte[] filtered = ArrayPool<byte>.Shared.Rent(filteredLength);
+        try
         {
-            int startY = chunk * rowsPerChunk;
-            int endY = Math.Min(height, startY + rowsPerChunk);
-            if (startY >= endY) return;
-            int filteredLength = (endY - startY) * (bytesPerRow + 1);
-            byte[] filtered = new byte[filteredLength];
-            uint s1 = 0;
-            uint s2 = 0;
-            int adlerBlock = 0;
-            int outputOffset = 0;
-
-            for (int y = startY; y < endY; y++)
+            uint[] stripS1 = new uint[chunks];
+            uint[] stripS2 = new uint[chunks];
+            Parallel.For(0, chunks, chunk =>
             {
-                int srcY = image.FlipY ? height - 1 - y : y;
-                int sourceRow = srcY * bytesPerRow;
-                filtered[outputOffset++] = 1;
-                byte prevR = 0, prevG = 0, prevB = 0, prevA = 0;
-                for (int x = 0; x < width; x++)
+                int startY = chunk * rowsPerChunk;
+                int endY = Math.Min(height, startY + rowsPerChunk);
+                if (startY >= endY) return;
+                uint s1 = 0;
+                uint s2 = 0;
+                int adlerBlock = 0;
+
+                for (int y = startY; y < endY; y++)
                 {
-                    int srcX = image.FlipX ? width - 1 - x : x;
-                    int sourceOffset = sourceRow + srcX * 4;
-                    byte r, g, b;
-                    if (image.IsBgra)
+                    int srcY = image.FlipY ? height - 1 - y : y;
+                    int sourceRow = srcY * bytesPerRow;
+                    int outputOffset = y * (bytesPerRow + 1);
+                    filtered[outputOffset++] = 1;
+                    byte prevR = 0, prevG = 0, prevB = 0, prevA = 0;
+                    for (int x = 0; x < width; x++)
                     {
-                        b = source[sourceOffset];
-                        g = source[sourceOffset + 1];
-                        r = source[sourceOffset + 2];
+                        int srcX = image.FlipX ? width - 1 - x : x;
+                        int sourceOffset = sourceRow + srcX * 4;
+                        byte r, g, b;
+                        if (image.IsBgra)
+                        {
+                            b = source[sourceOffset];
+                            g = source[sourceOffset + 1];
+                            r = source[sourceOffset + 2];
+                        }
+                        else
+                        {
+                            r = source[sourceOffset];
+                            g = source[sourceOffset + 1];
+                            b = source[sourceOffset + 2];
+                        }
+                        const byte a = 255;
+                        filtered[outputOffset++] = (byte)(r - prevR);
+                        filtered[outputOffset++] = (byte)(g - prevG);
+                        filtered[outputOffset++] = (byte)(b - prevB);
+                        filtered[outputOffset++] = (byte)(a - prevA);
+                        prevR = r;
+                        prevG = g;
+                        prevB = b;
+                        prevA = a;
                     }
-                    else
-                    {
-                        r = source[sourceOffset];
-                        g = source[sourceOffset + 1];
-                        b = source[sourceOffset + 2];
-                    }
-                    const byte a = 255;
-                    filtered[outputOffset++] = (byte)(r - prevR);
-                    filtered[outputOffset++] = (byte)(g - prevG);
-                    filtered[outputOffset++] = (byte)(b - prevB);
-                    filtered[outputOffset++] = (byte)(a - prevA);
-                    prevR = r;
-                    prevG = g;
-                    prevB = b;
-                    prevA = a;
-                }
 
-                int rowEnd = outputOffset;
-                for (int i = rowEnd - bytesPerRow - 1; i < rowEnd; i++)
+                    int rowEnd = outputOffset;
+                    for (int i = rowEnd - bytesPerRow - 1; i < rowEnd; i++)
+                    {
+                        s1 += filtered[i];
+                        s2 += s1;
+                        if (++adlerBlock == 5552)
+                        {
+                            s1 %= 65521;
+                            s2 %= 65521;
+                            adlerBlock = 0;
+                        }
+                    }
+                }
+                stripS1[chunk] = s1 % 65521;
+                stripS2[chunk] = s2 % 65521;
+            });
+
+            uint adler1 = 1;
+            uint adler2 = 0;
+            for (int chunk = 0; chunk < chunks; chunk++)
+            {
+                int startY = chunk * rowsPerChunk;
+                int endY = Math.Min(height, startY + rowsPerChunk);
+                if (startY >= endY) continue;
+                long length = (long)(endY - startY) * (bytesPerRow + 1);
+                adler2 = (uint)((adler2 + (ulong)(length % 65521) * adler1 + stripS2[chunk]) % 65521);
+                adler1 = (adler1 + stripS1[chunk]) % 65521;
+            }
+
+            // One pooled PNG buffer sized for the worst-case stored-block escape;
+            // deflate writes straight into its IDAT payload region.
+            byte[] png = ArrayPool<byte>.Shared.Rent(63 + 1024 + filteredLength);
+            try
+            {
+                png[0] = 137; png[1] = 80; png[2] = 78; png[3] = 71;
+                png[4] = 13; png[5] = 10; png[6] = 26; png[7] = 10;
+                WriteUInt32(png, 8, 13);
+                png[12] = (byte)'I'; png[13] = (byte)'H'; png[14] = (byte)'D'; png[15] = (byte)'R';
+                WriteUInt32(png, 16, (uint)width);
+                WriteUInt32(png, 20, (uint)height);
+                png[24] = 8; png[25] = 6; png[26] = 0; png[27] = 0; png[28] = 0;
+                WriteUInt32(png, 29, Crc32(png.AsSpan(12, 17)));
+                png[37] = (byte)'I'; png[38] = (byte)'D'; png[39] = (byte)'A'; png[40] = (byte)'T';
+                png[41] = 0x78;
+                png[42] = 0x01;
+                // Rent-backed sink rooted at the IDAT payload: the ctor treats
+                // count as preexisting content, but a fresh stream's Position
+                // starts at its origin, so deflate overwrites in place from the
+                // first payload byte; overflow throws instead of reallocating.
+                MemoryStream sink = new(png, 43, png.Length - 43, writable: true, publiclyVisible: true);
+                using (DeflateStream deflate = new(sink, CompressionLevel.Fastest, leaveOpen: true))
                 {
-                    s1 += filtered[i];
-                    s2 += s1;
-                    if (++adlerBlock == 5552)
-                    {
-                        s1 %= 65521;
-                        s2 %= 65521;
-                        adlerBlock = 0;
-                    }
+                    deflate.Write(filtered, 0, filteredLength);
                 }
+                // MemoryStream.Position is origin-relative: bytes written so far.
+                int compressedLength = (int)sink.Position;
+                int idatPayloadLength = 6 + compressedLength;
+                WriteUInt32(png, 33, (uint)idatPayloadLength);
+                WriteUInt32(png, 43 + compressedLength, (adler2 << 16) | adler1);
+                int crcOffset = 47 + compressedLength;
+                WriteUInt32(png, crcOffset, Crc32(png.AsSpan(37, 4 + idatPayloadLength)));
+                int iendOffset = crcOffset + 4;
+                WriteUInt32(png, iendOffset, 0);
+                png[iendOffset + 4] = (byte)'I'; png[iendOffset + 5] = (byte)'E'; png[iendOffset + 6] = (byte)'N'; png[iendOffset + 7] = (byte)'D';
+                WriteUInt32(png, iendOffset + 8, Crc32(png.AsSpan(iendOffset + 4, 4)));
+                pngLength = iendOffset + 12;
+                return png;
             }
-            s1 %= 65521;
-            s2 %= 65521;
-
-            using MemoryStream compressed = new();
-            DeflateStream deflate = new(compressed, CompressionLevel.Fastest, leaveOpen: true);
-            deflate.Write(filtered, 0, filtered.Length);
-            if (endY < height)
+            catch
             {
-                // Z_SYNC_FLUSH: byte-align a non-final block so the next strip
-                // can continue the same zlib stream without a BFINAL marker.
-                deflate.Flush();
+                ArrayPool<byte>.Shared.Return(png);
+                throw;
             }
-            else
-            {
-                deflate.Dispose();
-            }
-            strips[chunk] = new PngStrip(compressed.ToArray(), filteredLength, s1, s2);
-        });
-
-        uint adler1 = 1;
-        uint adler2 = 0;
-        using MemoryStream idat = new();
-        idat.WriteByte(0x78);
-        idat.WriteByte(0x01);
-        foreach (PngStrip strip in strips)
-        {
-            if (strip == null) continue;
-            idat.Write(strip.Compressed, 0, strip.Compressed.Length);
-            adler2 = (uint)((adler2 + (ulong)(strip.FilteredLength % 65521) * adler1 + strip.S2) % 65521);
-            adler1 = (adler1 + strip.S1) % 65521;
         }
-        WriteUInt32(idat, (adler2 << 16) | adler1);
-
-        using MemoryStream ihdr = new();
-        WriteUInt32(ihdr, (uint)width);
-        WriteUInt32(ihdr, (uint)height);
-        ihdr.Write([8, 6, 0, 0, 0]);
-
-        using MemoryStream png = new();
-        png.Write([137, 80, 78, 71, 13, 10, 26, 10]);
-        WriteChunk(png, "IHDR", ihdr.GetBuffer().AsSpan(0, (int)ihdr.Length));
-        WriteChunk(png, "IDAT", idat.GetBuffer().AsSpan(0, (int)idat.Length));
-        WriteChunk(png, "IEND", ReadOnlySpan<byte>.Empty);
-        return png.ToArray();
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(filtered);
+        }
     }
 
-    private static void WriteChunk(Stream output, string type, ReadOnlySpan<byte> data)
+    private static void WritePngFile(string path, byte[] buffer, int length)
     {
-        WriteUInt32(output, (uint)data.Length);
+        using FileStream stream = new(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        stream.Write(buffer, 0, length);
+    }
+
+    private static uint Crc32(ReadOnlySpan<byte> data)
+    {
         uint crc = 0xFFFFFFFFu;
-        foreach (byte value in Encoding.ASCII.GetBytes(type))
-        {
-            output.WriteByte(value);
-            crc = Crc32Table[(crc ^ value) & 0xFF] ^ (crc >> 8);
-        }
         foreach (byte value in data)
         {
             crc = Crc32Table[(crc ^ value) & 0xFF] ^ (crc >> 8);
         }
-        output.Write(data);
-        WriteUInt32(output, crc ^ 0xFFFFFFFFu);
+        return crc ^ 0xFFFFFFFFu;
     }
 
-    private static void WriteUInt32(Stream output, uint value)
+    private static void WriteUInt32(byte[] buffer, int offset, uint value)
     {
-        output.WriteByte((byte)(value >> 24));
-        output.WriteByte((byte)(value >> 16));
-        output.WriteByte((byte)(value >> 8));
-        output.WriteByte((byte)value);
+        buffer[offset] = (byte)(value >> 24);
+        buffer[offset + 1] = (byte)(value >> 16);
+        buffer[offset + 2] = (byte)(value >> 8);
+        buffer[offset + 3] = (byte)value;
     }
 
     private static uint[] CreateCrc32Table()
@@ -402,8 +451,9 @@ internal sealed class RsaBridge : IDisposable
         {
             lock (_gate)
             {
-                if (_capture == null || SwkbdAppletDialog.RsaActive == null) return;
+                if (_capture is not { Claimed: false } || SwkbdAppletDialog.RsaActive == null) return;
                 Capture capture = _capture;
+                capture.Claimed = true;
                 _capture = null;
                 long startedAt = Stopwatch.GetTimestamp();
                 try
@@ -474,7 +524,11 @@ internal sealed class RsaBridge : IDisposable
             _epoch = null;
             _capture?.Done.TrySetException(new IOException("Device bridge disconnected"));
             _capture = null;
-            _latestEncoded = null;
+            if (_latestEncoded != null)
+            {
+                ArrayPool<byte>.Shared.Return(_latestEncoded.Bytes);
+                _latestEncoded = null;
+            }
         }
     }
 
@@ -538,12 +592,13 @@ internal sealed class RsaBridge : IDisposable
                     EncodedFrame cached = _latestEncoded;
                     _latestEncoded = null;
                     _lastDeliveredFrame = cached.Frame;
+                    capture.Claimed = true;
                     _capture = capture;
                     _ = Task.Run(() =>
                     {
                         try
                         {
-                            File.WriteAllBytes(capture.Path, cached.Bytes);
+                            WritePngFile(capture.Path, cached.Bytes, cached.Length);
                             long completedAt = Stopwatch.GetTimestamp();
                             capture.Done.TrySetResult([cached.Frame.ToString(CultureInfo.InvariantCulture)]);
                             LogCapture(capture, "game", cached.Frame, completedAt, writer =>
@@ -555,6 +610,7 @@ internal sealed class RsaBridge : IDisposable
                             });
                         }
                         catch (Exception error) { capture.Done.TrySetException(error); }
+                        finally { ArrayPool<byte>.Shared.Return(cached.Bytes); }
                     });
                 }
                 else
